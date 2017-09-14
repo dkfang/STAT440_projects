@@ -1,0 +1,821 @@
+---
+title: "Santander Product Recommendation Modelling File"
+author: "Team: Stat 440 Dong Kai Fang 301170579"
+date: "November 16, 2016"
+output: html_document
+---
+
+```{r setup, include=FALSE, echo=TRUE, message=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message=FALSE)
+```
+
+The Data
+
+The goal of this competition is to predict which new Santander products, if any, a customer will purchase in the following month. Therefore, we need to predict additional products a customer will get in the last month, 2016-06-28, in addition to what they already have at 2016-05-28.
+
+This dataset includes a variety of data fields we can use as predictions, including:
+the customer's age
+the customer's sex
+the customer's country of residence
+the customer's seniority (months)
+the customer's gross household income
+
+```{r message=FALSE, warning=FALSE}
+## install and load packages
+pacman::p_load(data.table, readr, dplyr, tidyr, lubridate, ggplot2, readr, LaF, randomForest, nnet, caret, extraTrees, Matrix)
+```
+
+
+```{r eval_metric, echo = FALSE} 
+#' Compute the average precision at k
+#'
+#' This function computes the average precision at k
+#' between two sequences
+#'
+#' @param k max length of predicted sequence
+#' @param actual ground truth set (vector)
+#' @param predicted predicted sequence (vector)
+#' @export
+apk <- function(k, actual, predicted)
+{
+    score <- 0.0
+    cnt <- 0.0
+    for (i in 1:min(k,length(predicted)))
+    {
+        if (predicted[i] %in% actual && !(predicted[i] %in% predicted[0:(i-1)]))
+        {
+            cnt <- cnt + 1
+            score <- score + cnt/i 
+        }
+    }
+    score <- score / min(length(actual), k)
+    score
+}
+
+#' Compute the mean average precision at k
+#'
+#' This function computes the mean average precision at k
+#' of two lists of sequences.
+#'
+#' @param k max length of predicted sequence
+#' @param actual list of ground truth sets (vectors)
+#' @param predicted list of predicted sequences (vectors)
+#' @export
+eval_metric <- function (k, actual, predicted)
+{
+    if( length(actual)==0 || length(predicted)==0 ) 
+    {
+	    return(0.0)
+    }
+
+    scores <- rep(0, length(actual))
+    for (i in 1:length(scores))
+    {
+        scores[i] <- apk(k, actual[[i]], predicted[[i]])
+    }
+    score <- mean(scores)
+    score
+}
+```
+
+## First Glance
+First, we pull in a subset of the data
+```{r message=FALSE, warning=FALSE, cache = T}
+set.seed(2016)
+# read in all data
+# df<- fread("data/train_ver2.csv")
+# df[,nomprov:=NULL]
+
+# Read in small subset example
+# n_rows <- 13647309
+# n_sample <- 1e6
+# system.time(DF <- sample_lines("./data/train_ver2.csv", n_sample, nlines = n_rows))
+# col_names <- readr::read_lines("./data/train_ver2.csv", n_max = 1)
+# DF <- c(col_names, DF)
+# writeLines(DF, con = "tmp.csv")
+
+# read the subset of the train data
+train <- read_csv("tmp.csv", col_types = cols(indrel_1mes = col_character()))
+unique.id    <- unique(train$ncodpers)
+limit.people <- 2.5e5
+unique.id    <- unique.id[sample(length(unique.id),limit.people)]
+train          <- train[train$ncodpers %in% unique.id,]
+
+test <- read_csv('data/test_ver2.csv', col_types = cols(indrel_1mes = col_character()))
+```
+
+Combine to a full data set
+```{r}
+dummy <- data.frame(0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23)
+colnames(dummy)<- names(train[,25:48])
+new_test <- cbind(test,dummy)
+new_test[,25:48] <- NA
+
+full<-rbind(train,new_test)
+
+df <- full
+
+```
+
+Differencing feature
+```{r Differencing between products}
+#diff <- df %>% group_by(ncodpers)
+```
+
+We have a number of demographics for each individual as well as the products they currently own. First, format some dates
+
+```{r message=FALSE, warning=FALSE, cache = T}
+df$fecha_dato <- as.POSIXct(strptime(df$fecha_dato,format="%Y-%m-%d"))
+df$fecha_alta <- as.POSIXct(strptime(df$fecha_alta,format="%Y-%m-%d"))
+unique(df$fecha_dato)
+```
+
+
+After combining to a full data set, we can continue to investigate the data set
+
+I printed the values just to double check the dates were in standard Year-Month-Day format. I expect that customers will be more likely to buy products at certain months of the year (Christmas bonuses?), so let's add a month column. I don't think the month that they joined matters, so just do it for one.
+```{r message=FALSE, warning=FALSE}
+df$month <- month(df$fecha_dato)
+```
+
+Are there any columns missing values?
+```{r message=FALSE, warning=FALSE, cache = T}
+# sapply(df,function(x)any(is.na(x)))
+```
+
+Definitely. Onto data cleaning.
+
+##Data Cleaning
+
+Going down the list, start with `age`
+```{r message=FALSE, warning=FALSE, cache = T}
+ggplot(data=df,aes(x=age)) + 
+  geom_bar(alpha=0.75,fill="tomato",color="black") +
+  ggtitle("Age Distribution")
+```
+
+In addition to NA, there are people with very small and very high ages.
+It's also interesting that the distribution is bimodal. There are a large number of university aged students, and then another peak around middle-age. Let's separate the distribution and move the outliers to the mean of the closest one.
+```{r message=FALSE, warning=FALSE}
+df$age[(df$age < 18)]  <- mean(df$age[(df$age >= 18) & (df$age <=30)],na.rm=TRUE)
+df$age[(df$age > 100)] <- mean(df$age[(df$age >= 30) & (df$age <=100)],na.rm=TRUE)
+df$age[is.na(df$age)]  <- median(df$age,na.rm=TRUE)
+df$age                 <- round(df$age)
+```
+
+```{r message=FALSE, warning=FALSE, cache = T}
+ggplot(data=df,aes(x=age)) + 
+  geom_bar(alpha=0.75,fill="tomato",color="black") +
+  xlim(c(18,100)) + 
+  ggtitle("Age Distribution")
+```
+
+Looks better.  
+
+Next `ind_nuevo`, which indicates whether a customer is new or not. How many missing values are there?
+```{r message=FALSE, warning=FALSE}
+sum(is.na(df$ind_nuevo))
+```
+
+Let's see if we can fill in missing values by looking how many months of history these customers have.
+```{r message=FALSE, warning=FALSE}
+months.active <- df[is.na(df$ind_nuevo),] %>% group_by(ncodpers) %>% dplyr::summarise(months.active=n()) %>% select(months.active)
+max(months.active)
+```
+
+Looks like these are all new customers, so replace accordingly.
+```{r message=FALSE, warning=FALSE}
+df$ind_nuevo[is.na(df$ind_nuevo)] <- 1 
+```
+
+Now, `antiguedad`
+```{r message=FALSE, warning=FALSE}
+sum(is.na(df$antiguedad))
+```
+
+That number again. Probably the same people that we just determined were new customers. Double check.
+```{r message=FALSE, warning=FALSE}
+summary(df[is.na(df$antiguedad),]%>%select(ind_nuevo))
+```
+
+Yup, same people. Let's give them minimum seniority.
+
+```{r message=FALSE, warning=FALSE}
+df$antiguedad[is.na(df$antiguedad)] <- min(df$antiguedad,na.rm=TRUE)
+df$antiguedad[df$antiguedad<0]      <- 0
+```
+
+Some entries don't have the date they joined the company. Just give them something in the middle of the pack
+```{r message=FALSE, warning=FALSE}
+df$fecha_alta[is.na(df$fecha_alta)] <- median(df$fecha_alta,na.rm=TRUE)
+```
+
+
+Next is `indrel`, which indicates:
+
+> 1 (First/Primary), 99 (Primary customer during the month but not at the end of the month)
+
+This sounds like a promising feature. I'm not sure if primary status is something the customer chooses or the company assigns, but either way it seems intuitive that customers who are dropping down are likely to have different purchasing behaviors than others.
+
+```{r message=FALSE, warning=FALSE}
+table(df$indrel)
+```
+
+Fill in missing with the more common status.
+
+```{r message=FALSE, warning=FALSE}
+df$indrel[is.na(df$indrel)] <- 1
+```
+
+> tipodom	- Addres type. 1, primary address
+ cod_prov	- Province code (customer's address)
+
+`tipodom` doesn't seem to be useful, and the province code is not needed becaue the name of the province exists in `nomprov`.
+```{r message=FALSE, warning=FALSE}
+df <- df %>% select(-tipodom,-cod_prov)
+```
+
+Quick check back to see how we are doing on missing values
+```{r message=FALSE, warning=FALSE}
+# sapply(df,function(x)any(is.na(x)))
+```
+
+Getting closer.
+
+```{r message=FALSE, warning=FALSE}
+sum(is.na(df$ind_actividad_cliente))
+```
+By now you've probably noticed that this number keeps popping up. A handful of the entries are just bad, and should probably just be excluded from the model. But for now I will just clean/keep them.  
+
+Just a couple more features.
+
+```{r message=FALSE, warning=FALSE}
+df$ind_actividad_cliente[is.na(df$ind_actividad_cliente)] <- median(df$ind_actividad_cliente,na.rm=TRUE)
+```
+
+```{r message=FALSE, warning=FALSE}
+# unique(df$nomprov)
+```
+
+There's some rows missing a city that I'll relabel
+
+```{r message=FALSE, warning=FALSE}
+df$nomprov[is.na(df$nomprov)] <- "UNKNOWN"
+```
+
+(different from the original, in order to operate on the full data set)
+Now for gross income, aka `renta`
+```{r message=FALSE, warning=FALSE}
+sum(is.na(df$renta))
+
+df[which(is.na(df$renta)),]$renta <- NA
+# check 
+# integer
+is.number <- function(x) grepl("[[:digit:]]", x)
+table(is.number(df[which(!is.na(df$renta)),]$renta))
+
+# converge str to numeric
+options(digits = 12)
+df$renta <- as.numeric(df$renta)
+```
+
+Here is a feature that is missing a lot of values. Rather than just filling them in with a median, it's probably more accurate to break it down region by region. To that end, let's take a look at the median income by region, and in the spirit of the competition let's color it like the Spanish flag.
+```{r fig.width=8, fig.height=6.3}
+
+df %>%
+  filter(!is.na(renta)) %>%
+  group_by(nomprov) %>%
+  dplyr::summarise(med.income = median(renta)) %>%
+  arrange(med.income) %>%
+  mutate(city=factor(nomprov,levels=nomprov)) %>% # the factor() call prevents reordering the names
+  ggplot(aes(x=city,y=med.income)) +
+  geom_point(color="#c60b1e") +
+  guides(color=FALSE) +
+  xlab("City") +
+  ylab("Median Income") +
+  theme(axis.text.x=element_blank(), axis.ticks = element_blank()) +
+  geom_text(aes(x=city,y=med.income,label=city),angle=90,hjust=-.25) +
+  theme(plot.background=element_rect(fill="#c60b1e"),
+        panel.background=element_rect(fill="#ffc400"),
+        panel.grid =element_blank(),
+        axis.title =element_text(color="#ffc400"),
+        axis.text  =element_text(color="#ffc400"),
+        plot.title =element_text(color="#ffc400",size=32)) +
+  ylim(c(50000,200000)) +
+  ggtitle("Income Distribution by City")
+```
+
+ There's a lot of variation, so I think assigning missing incomes by province is a good idea. This code gets kind of confusing in a nested SQL statement kind of way, but the idea is to first group the data by city, and reduce to get the median. This intermediate data frame is joined by the original city names to expand the aggregated median incomes, ordered so that there is a 1-to-1 mapping between the rows, and finally the missing values are replaced.
+```{r message=FALSE, warning=FALSE}
+new.incomes <- df %>%
+  select(nomprov) %>%
+  merge(df %>%
+  group_by(nomprov) %>%
+  summarise(med.income=median(renta,na.rm=TRUE)),by="nomprov") %>%
+  select(nomprov,med.income) %>%
+  arrange(nomprov)
+df <- arrange(df,nomprov)
+df$renta[is.na(df$renta)] <- new.incomes$med.income[is.na(df$renta)]
+rm(new.incomes)
+
+df$renta[is.na(df$renta)] <- median(df$renta,na.rm=TRUE)
+df <- arrange(df,fecha_dato)
+```
+
+The last line is to account for any values that are still missing. For example, it seems every entry from Alava has NA for `renta`.
+
+
+I could try to fill in missing values for products by looking at previous months, but since it's such a small number of values for now I'll take the cheap way out.
+
+```{r message=FALSE, warning=FALSE}
+# These are target products
+df$ind_nomina_ult1[is.na(df$ind_nomina_ult1)] <- 0
+df$ind_nom_pens_ult1[is.na(df$ind_nom_pens_ult1)] <- 0
+```
+
+Now we have taken care of all the missing values. There's also a bunch of character columns that can contain empty strings, so we need to go through them. For the most part, entries with empty strings will be converted to an unknown category.
+
+```{r message=FALSE, warning=FALSE}
+# char.cols <- names(df)[sapply(df,is.character)]
+# for (name in char.cols){
+#   print(sprintf("Unique values for %s:", name))
+#   print(unique(df[[name]]))
+#   cat('\n')
+#   }
+```
+
+Okay, based on that and the definitions of each variable, I will fill the empty strings either with the most common value or create an unknown category based on what I think makes more sense.
+```{r message=FALSE, warning=FALSE}
+df$indfall[is.na(df$indfall)]                 <- "N"
+df$tiprel_1mes[is.na(df$tiprel_1mes)]         <- "A"
+df$indrel_1mes[is.na(df$indrel_1mes)]         <- "1"
+df$indrel_1mes[df$indrel_1mes=="P"]        <- "5" # change to just numbers because it currently contains letters and numbers
+df$indrel_1mes                             <- as.factor(as.integer(df$indrel_1mes))
+df$pais_residencia[is.na(df$pais_residencia)] <- "UNKNOWN"
+df$sexo[is.na(df$sexo)]      <- "UNKNOWN"
+df$ind_empleado[is.na(df$ind_empleado)]       <- "UNKNOWN"
+df$indext[is.na(df$indext)]                   <- "UNKNOWN"
+df$indresi[is.na(df$indresi)]                 <- "UNKNOWN"
+df$conyuemp[is.na(df$conyuemp)]               <- "UNKNOWN"
+df$segmento[is.na(df$segmento)]               <- "UNKNOWN"
+
+```
+Spliting the data from here
+```{r}
+df.train<-df[1:nrow(train),]
+df.test<-df[(nrow(train)+1):nrow(df),1:22]
+```
+
+Convert all the features to numeric dummy indicators (you'll see why in a second), and we're done cleaning
+```{r message=FALSE, warning=FALSE}
+features          <- grepl("ind_+.*ult.*",names(df.train))
+df.train[,features]     <- lapply(df.train[,features],function(x) as.integer(round(x)))
+df.train$total.services <- rowSums(df.train[,features],na.rm=TRUE)
+```
+
+Now for the main event. To study trends in customers adding or removing services, I will create a label for each product and month that indicates whether a customer added, dropped or maintained that service in that billing cycle. I will do this by assigning a numeric id to each unique time stamp, and then matching each entry with the one from the previous month. The difference in the indicator value for each product then gives the desired value.  
+A cool trick to turn dates into unique id numbers is to use `as.numeric(factor(...))`. Make sure to order them chronologically first.
+
+```{r message=FALSE, warning=FALSE}
+df.train               <- df.train %>% arrange(fecha_dato)
+df.train$month.id      <- as.numeric(factor((df.train$fecha_dato)))
+df.train$month.next.id <- df.train$month.id + 1
+```
+
+Now I'll build a function that will convert differences month to month into a meaningful label. Each month, a customer can either maintain their current status with a particular product, add it, or drop it.
+```{r message=FALSE, warning=FALSE}
+status.change <- function(x){
+  if ( length(x) == 1 ) { # if only one entry exists, I'll assume they are a new customer and therefore are adding services
+    label = ifelse(x==1,"Added","Maintained")
+  } else {
+    diffs <- diff(x) # difference month-by-month
+    diffs <- c(0,diffs) # first occurrence will be considered Maintained, which is a little lazy. A better way would be to check if the earliest date was the same as the earliest we have in the dataset and consider those separately. Entries with earliest dates later than that have joined and should be labeled as "Added"
+    label <- rep("Maintained", length(x))
+    label <- ifelse(diffs==1,"Added",
+                    ifelse(diffs==-1,"Dropped",
+                           "Maintained"))
+  }
+  label
+}
+```
+
+Now we can actually apply this function to each feature using `lapply` and `ave`
+(not working on the full data set)
+(I fix it in order to run on full data set but it crashed everytime)
+```{r echo=TRUE, message=FALSE, warning=FALSE, cache = T}
+features <- grepl("ind_+.*ult.*",names(df.train))
+df.train[,features] <- lapply(df.train[,features], function(x) return(ave(x,df.train$ncodpers, FUN=status.change)))
+```
+
+I'm only interested in seeing what influences people adding or removing services, so I'll trim away any instances of "Maintained". Since big melting/casting operations can be slow, I'll take the time to check for rows that should be completely removed, then melt the remainder and remove the others.
+```{r message=FALSE, warning=FALSE}
+interesting <- rowSums(df.train[,features]!="Maintained")
+df.train          <- df.train[interesting>0,]
+df.train          <- df.train %>%
+                gather(key=feature,
+                value=status,
+                ind_ahor_fin_ult1:ind_recibo_ult1)
+df.train          <- filter(df.train,status!="Maintained")
+```
+
+
+Data Visualizations
+# *Note: This is still a work in progress*
+Does the ratio of dropping/adding services change over the year?
+```{r Data Visualizations}
+totals.by.feature <- df.train %>%
+  group_by(month,feature) %>%
+  summarise(counts=n())
+
+df.train %>% 
+  group_by(month,feature,status) %>%
+  summarise(counts=n())%>%
+  ungroup() %>%
+  inner_join(totals.by.feature,by=c("month","feature")) %>%
+
+  mutate(counts=counts.x/counts.y) %>%
+  ggplot(aes(y=counts,x=factor(month.abb[month],levels=month.abb[seq(12,1,-1)]))) +
+  geom_bar(aes(fill=status), stat="identity") +
+  facet_wrap(facets=~feature,ncol = 6) +
+  coord_flip() +
+  ylab("Count") +
+  xlab("") + 
+  ylim(limits=c(0,1)) +
+  ggtitle("Relative Service \nChanges by Month") +
+  theme(axis.text   = element_text(size=10),
+        legend.text = element_text(size=14),
+        legend.title= element_blank()      ,
+        strip.text  = element_text(face="bold")) +
+  scale_fill_manual(values=c("cyan","magenta"))
+  # scale_fill_brewer(palette = 3) 
+```
+
+How product changes vary over the calendar year. Some months occur more than others, so we need to account for that.
+```{r}
+month.counts              <- table(unique(df.train$month.id)%%12)
+cur.names                 <- names(month.counts)
+cur.names[cur.names=="0"] <- "12"
+names(month.counts) <- cur.names
+month.counts              <- data.frame(month.counts) %>%
+  rename(month=Var1,month.count=Freq) %>% mutate(month=as.numeric(month))
+
+df.train %>% 
+  group_by(month,feature,status) %>%
+  summarise(counts=n())%>%
+  ungroup() %>%
+  inner_join(month.counts,by="month") %>%
+
+  mutate(counts=counts/month.count) %>%
+  ggplot(aes(y=counts,x=factor(month.abb[month],levels=month.abb[seq(12,1,-1)]))) +
+  geom_bar(aes(fill=status), stat="identity") +
+  facet_wrap(facets=~feature,ncol = 6) +
+  coord_flip() +
+  ylab("Count") +
+  xlab("") + 
+  ggtitle("Average Service \nChanges by Month") +
+  theme(axis.text    = element_text(size=10),
+        legend.text  = element_text(size=14),
+        legend.title = element_blank()      ,
+        strip.text   = element_text(face="bold")) +
+  scale_fill_manual(values=c("cyan","magenta"))
+  # scale_fill_brewer(palette = 3) 
+```
+
+
+```{r}
+df.train %>%
+  filter(sexo!="UNKNOWN") %>%
+  ggplot(aes(x=sexo)) +
+  geom_bar(aes(fill=status)) +
+  facet_wrap(facets=~feature,ncol = 6) +
+  ylab("Count") +
+  xlab("") +
+  ggtitle("Service Changes by Gender") +
+  theme(axis.text    = element_text(size=10),
+        legend.text  = element_text(size=14),
+        legend.title = element_blank()      ,
+        strip.text   = element_text(face="bold")) +
+  scale_fill_manual(values=c("cyan","magenta"))
+  # scale_fill_brewer(palette = 3) 
+```
+```{r}
+tot.H  <- sum(df.train$sexo=="H", na.rm = T)
+tot.V  <- sum(df.train$sexo=="V", na.rm = T)
+tmp.df.train <- df.train %>%
+  group_by(sexo,status) %>%
+  summarise(counts=n())
+tmp.df.train$counts[tmp.df.train$sexo=="H"] <- tmp.df.train$counts[tmp.df.train$sexo=="H"] / tot.H
+tmp.df.train$counts[tmp.df.train$sexo=="V"] <- tmp.df.train$counts[tmp.df.train$sexo=="V"] / tot.V
+tmp.df.train %>%
+  filter(sexo!="UNKNOWN") %>%
+  ggplot(aes(x=factor(feature),y=counts)) +
+  geom_bar(aes(fill=status,sexo),stat='identity') +
+  coord_flip() +
+  ylab("Ratio") +
+  xlab("") +
+  ggtitle("Normalized Service \n Changes by Gender") +
+  theme(axis.text    = element_text(size=20),
+        legend.text  = element_text(size=14),
+        legend.title = element_blank()      ,
+        strip.text   = element_text(face="bold")) +
+  scale_fill_manual(values=c("cyan","magenta"))
+  # scale_fill_brewer(palette = 3) 
+rm(tmp.df.train)
+```
+
+```{r}
+tot.new     <- sum(df.train$ind_nuevo==1)
+tot.not.new <- sum(df.train$ind_nuevo!=1)
+tmp.df.train      <- df.train %>%
+  group_by(ind_nuevo,status) %>%
+  summarise(counts=n())
+tmp.df.train$counts[tmp.df.train$ind_nuevo==1] = tmp.df.train$counts[tmp.df.train$ind_nuevo==1] / tot.new
+tmp.df.train$counts[tmp.df.train$ind_nuevo!=1] = tmp.df.train$counts[tmp.df.train$ind_nuevo!=1] / tot.not.new
+tmp.df.train %>%
+  ggplot(aes(x=factor(feature),y=counts)) +
+  geom_bar(aes(fill=status,factor(ind_nuevo)),stat='identity') +
+  coord_flip() +
+  ylab("Count") +
+  xlab("") +
+  ggtitle("Normalized Service \n Changes by New Status") +
+  theme(axis.text    = element_text(size=10),
+        legend.text  = element_text(size=14),
+        legend.title = element_blank()      ,
+        strip.text   = element_text(face="bold")) +
+  scale_fill_manual(values=c("cyan","magenta"))
+  # scale_fill_brewer(palette = 3) 
+rm(tmp.df.train)
+```
+
+```{r}
+df.train %>%
+  group_by(nomprov,status) %>%
+  summarise(y=mean(total.services)) %>%
+  ggplot(aes(x=factor(nomprov,levels=sort(unique(nomprov),decreasing=TRUE)),y=y)) +
+  geom_bar(stat="identity",aes(fill=status)) +
+  geom_text(aes(label=nomprov),
+            y=0.2,
+            hjust=0,
+            angle=0,
+            size=3,
+            color="#222222") +
+  coord_flip() +
+  xlab("City") +
+  ylab("Total # Changes") + 
+  ggtitle("Service Changes\n by City") +
+  theme(axis.text    = element_blank(),
+        legend.text  = element_text(size=14),
+        legend.title = element_text(size=18)) +
+  scale_fill_manual(values=c("cyan","magenta"))
+```
+
+```{r}
+df.train %>%
+  group_by(antiguedad,status) %>%
+  summarise(counts=n()) %>%
+  ggplot(aes(x=factor(antiguedad),y=log(counts))) +
+  geom_point(alpha=0.6,aes(color=status)) +
+  xlab("Seniority (Months)") +
+  ylab("Total # Changes") + 
+  ggtitle("Service Changes \n by Seniority") +
+  theme(axis.text    = element_blank(),
+        legend.text  = element_text(size=14),
+        legend.title = element_text(size=18)) +
+  scale_color_manual(values=c("cyan","magenta"))
+```
+
+```{r}
+df.train %>%
+  ggplot(aes(x=age,y=log(renta))) +
+  geom_point(alpha=0.5,aes(color=status)) +
+  xlab("Age") +
+  ylab("Income (log scale)") + 
+  ggtitle("Income vs. Age") +
+  theme(
+        legend.text  = element_text(size=14),
+        legend.title = element_text(size=18)) +
+  scale_color_manual(values=c("cyan","magenta"))
+```
+
+```{r}
+df.train %>%
+  group_by(ncodpers) %>%
+  summarise(age=max(age),seniority=max(antiguedad)) %>%
+  select(age,seniority) %>%
+  ggplot(aes(x=age,y=seniority)) +
+  geom_point(alpha=0.4) +
+  ggtitle("Seniority vs. Age")
+```
+
+```{r}
+df.train %>%
+  group_by(nomprov,status) %>%
+  summarise(y=mean(total.services)) %>%
+  ggplot(aes(x=factor(nomprov,levels=sort(unique(nomprov),decreasing=TRUE)),y=y)) +
+  geom_bar(stat="identity",aes(fill=status)) +
+  geom_text(aes(label=nomprov),
+            y=0.2,
+            hjust=0,
+            angle=0,
+            size=3,
+            color="#222222") +
+  coord_flip() +
+  xlab("City") +
+  ylab("Total # Changes") + 
+  ggtitle("Service Changes\n by City") +
+  theme(axis.text    = element_blank(),
+        legend.text  = element_text(size=14),
+        legend.title = element_text(size=18)) +
+  scale_fill_manual(values=c("cyan","magenta"))
+```
+
+Convert Variables
+```{r Convert Variables, include = F}
+#names(df.train)
+df.train <- df.train[,c(1:22,27)]
+df.train$ind_empleado <- as.factor(df.train$ind_empleado)
+df.train$pais_residencia <- as.factor(df.train$pais_residencia)
+df.train$sexo <- as.factor(df.train$sexo)
+df.train$ind_nuevo <- as.factor(df.train$ind_nuevo)
+df.train$indrel <- as.factor(df.train$indrel)
+df.train$tiprel_1mes <- as.factor(df.train$tiprel_1mes)
+df.train$indresi <- as.factor(df.train$indresi)
+df.train$indext <- as.factor(df.train$indext)
+df.train$conyuemp <- as.factor(df.train$conyuemp)
+df.train$canal_entrada <- as.factor(df.train$canal_entrada)
+df.train$indfall <- as.factor(df.train$indfall)
+df.train$nomprov <- as.factor(df.train$nomprov)
+df.train$ind_actividad_cliente <- as.factor(df.train$ind_actividad_cliente)
+df.train$segmento <- as.factor(df.train$segmento)
+
+df.test$ind_empleado <- as.factor(df.test$ind_empleado)
+df.test$pais_residencia <- as.factor(df.test$pais_residencia)
+df.test$sexo <- as.factor(df.test$sexo)
+df.test$ind_nuevo <- as.factor(df.test$ind_nuevo)
+df.test$indrel <- as.factor(df.test$indrel)
+df.test$tiprel_1mes <- as.factor(df.test$tiprel_1mes)
+df.test$indresi <- as.factor(df.test$indresi)
+df.test$indext <- as.factor(df.test$indext)
+df.test$conyuemp <- as.factor(df.test$conyuemp)
+df.test$canal_entrada <- as.factor(df.test$canal_entrada)
+df.test$indfall <- as.factor(df.test$indfall)
+df.test$nomprov <- as.factor(df.test$nomprov)
+df.test$ind_actividad_cliente <- as.factor(df.test$ind_actividad_cliente)
+df.test$segmento <- as.factor(df.test$segmento)
+
+levels(df.test$ind_empleado) <- union(levels(df.train$ind_empleado),
+levels(df.test$ind_empleado))
+levels(df.test$pais_residencia) <- union(levels(df.train$pais_residencia),
+levels(df.test$pais_residencia))
+levels(df.test$sexo) <- union(levels(df.train$sexo), levels(df.test$sexo))
+levels(df.test$ind_nuevo) <- union(levels(df.train$ind_nuevo),
+levels(df.test$ind_nuevo))
+levels(df.test$indrel) <- union(levels(df.train$indrel), levels(df.test$indrel))
+levels(df.test$tiprel_1mes) <- union(levels(df.train$tiprel_1mes),
+levels(df.test$tiprel_1mes))
+levels(df.test$indresi) <- union(levels(df.train$indresi),
+levels(df.test$indresi))
+levels(df.test$indext) <- union(levels(df.train$indext), levels(df.test$indext))
+levels(df.test$conyuemp) <- union(levels(df.train$conyuemp),
+levels(df.test$conyuemp))
+levels(df.test$canal_entrada) <- union(levels(df.train$canal_entrada),
+levels(df.test$canal_entrada))
+levels(df.test$indfall) <- union(levels(df.train$indfall),
+levels(df.test$indfall))
+levels(df.test$nomprov) <- union(levels(df.train$nomprov),
+levels(df.test$nomprov))
+levels(df.test$ind_actividad_cliente) <-
+union(levels(df.train$ind_actividad_cliente),
+levels(df.test$ind_actividad_cliente))
+levels(df.test$segmento) <- union(levels(df.train$segmento),
+levels(df.test$segmento))
+
+sapply(df.train,function(x)any(is.na(x)))
+```
+
+Models
+After data cleaning, we are going to fit a model to predict an additional products that customers will get in the next month
+
+Model1: Random Forest
+We first chose Random Forest with these five features which we discussed and fixed previously.
+```{r Random Forest }
+#y <- as.factor(df.train$feature)
+
+#tree_fit <- randomForest(y~sexo+age+antiguedad+indrel+ind_actividad_cliente+renta+segmento, data=df.train, ntree=150, do.trace=10)
+
+#save(tree_fit,  file = "random_Forest.RData")
+
+#load("random_Forest.RData")
+```
+
+Model2: Multinomial Logistic Regression
+Next, we chose the model which Jacob recommanded in the lecture
+```{r multinom}
+#mn_fit <- multinom(feature ~ sexo+age+antiguedad+indrel+ind_actividad_cliente+renta+segmento, data=df.train)
+# 
+# save(mn_fit,  file = "multinom.RData")
+
+#load("multinom.RData")
+```
+
+Model3: ExtraTrees
+In the end, we wanted to use a new classifier(extraTrees), but the computational time seems to take much longer than the pervious two models
+```{r ExtraTrees}
+# X <-sparse.model.matrix(~sexo+age+ind_nuevo+antiguedad+ind_actividad_cliente+renta+segmento, data=df.train)
+# et_fit <- extraTrees(X,factor(df.train$feature), ntree=150, nodesize=3,numRandomCuts=2)
+# save(et_fit,  file = "extraTrees.RData")
+# 
+# X.test <- sparse.model.matrix(~sexo+age+ind_nuevo+antiguedad+ind_actividad_cliente+renta+segmento, data=df.test)
+# 
+#load("extraTrees.RData")
+```
+
+Prediciton 
+```{r Prediciton}
+#pred.rf <- predict(tree_fit, df.test, "class")
+#pred.et <- predict(et_fit, X.test)
+#pred.mn <- predict(mn_fit, df.test, "class")
+
+```
+
+We wish to use a multinomial regression model, but the prediction values were worse than just using the combination of the top 7 products, we will add a new feature in our models based on the difference of products a customer added each month
+For now, we will just keep using the combination of the top popular products 
+Get all the customers in the last month(May) (This part is heavily based on Lucas's codes)
+```{r Top Products chose by customers}
+# identify what products customers bought in May 2016
+most_recent_per_customer <- df %>% filter(fecha_dato=='2016-05-28') %>%
+  select(ncodpers,ind_ahor_fin_ult1,ind_aval_fin_ult1,ind_cco_fin_ult1,
+         ind_cder_fin_ult1,ind_cno_fin_ult1,ind_ctju_fin_ult1,ind_ctma_fin_ult1,
+         ind_ctop_fin_ult1,ind_ctpp_fin_ult1,ind_deco_fin_ult1,ind_deme_fin_ult1,
+         ind_dela_fin_ult1,ind_ecue_fin_ult1,ind_fond_fin_ult1,ind_hip_fin_ult1,
+         ind_plan_fin_ult1,ind_pres_fin_ult1,ind_reca_fin_ult1,ind_tjcr_fin_ult1,
+         ind_valo_fin_ult1,ind_viv_fin_ult1,ind_nomina_ult1,ind_nom_pens_ult1,
+         ind_recibo_ult1) %>% 
+  gather(product_name,count,2:25) %>% 
+  filter(count>0) %>% 
+  arrange(ncodpers,-count)
+
+# cacluate the most popular products in May 2016
+most_popular_1_months = df %>% filter(fecha_dato=='2016-05-28') %>%
+  select(ncodpers,ind_ahor_fin_ult1,ind_aval_fin_ult1,ind_cco_fin_ult1,
+         ind_cder_fin_ult1,ind_cno_fin_ult1,ind_ctju_fin_ult1,ind_ctma_fin_ult1,
+         ind_ctop_fin_ult1,ind_ctpp_fin_ult1,ind_deco_fin_ult1,ind_deme_fin_ult1,
+         ind_dela_fin_ult1,ind_ecue_fin_ult1,ind_fond_fin_ult1,ind_hip_fin_ult1,
+         ind_plan_fin_ult1,ind_pres_fin_ult1,ind_reca_fin_ult1,ind_tjcr_fin_ult1,
+         ind_valo_fin_ult1,ind_viv_fin_ult1,ind_nomina_ult1,ind_nom_pens_ult1,
+         ind_recibo_ult1) %>% 
+  gather(product_name,count,2:25) %>%
+  group_by(product_name) %>%
+  summarize(customers=sum(count)) %>%
+  as.data.frame %>%
+  arrange(-customers) %>%
+  ungroup() %>%
+  mutate(index=1)
+```
+
+The most popular 10 products bought by customers in May 2016
+```{r}
+head(most_popular_1_months,10)
+```
+
+```{r}
+# get unique customers in May
+all_customers = data.frame(ncodpers=unique(most_recent_per_customer$ncodpers), index=1)
+
+# calculate all the combinations of products and unique customers
+full_panel = inner_join(all_customers, most_popular_1_months,by="index")
+full_panel$index=NULL
+
+# excluding the products already owned by customers in May
+results_excluding = anti_join(full_panel, most_recent_per_customer, c("ncodpers","product_name"))
+results_excluding = arrange(results_excluding, ncodpers, -customers)
+
+# after excluding the products, combined the product names for each customer in May
+recs_list = group_by(results_excluding,ncodpers) %>% 
+  summarize(added_products=paste(product_name,collapse=" ")) %>%
+  ungroup() %>%
+  as.data.frame
+
+# get the ncodpers column from test set
+df_test_ids = data.frame(ncodpers=test$ncodpers)
+
+# merge the test set customer id and customer in May
+submission = left_join(df_test_ids,recs_list,c("ncodpers"))
+table(is.na(submission))
+```
+
+
+## Create Submission File
+```{r load_test_ data}
+
+# submission <- data.frame(ncodpers = df.test$ncodpers, added_products = pred.mn)
+
+# Replace all the missing values based on the most popular 7 products
+submission[is.na(submission$added_products),]$added_products=("ind_cco_fin_ult1 ind_recibo_ult1 ind_ctop_fin_ult1 ind_ecue_fin_ult1 ind_cno_fin_ult1 ind_nom_pens_ult1 ind_nomina_ult1")
+# Write submission file
+write.csv(submission,"submission_file.csv",row.names=F,quote=F)
+
+```
+
+
+Note: This script is based heavily on a kernel posted online by a Kaggle user. You can find the original here: https://www.kaggle.com/apryor6/santander-product-recommendation/detailed-cleaning-visualization/notebook

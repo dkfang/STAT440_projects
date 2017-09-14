@@ -1,0 +1,247 @@
+---
+title: "House Prices Modelling File"
+author: "Team: DongKai(Alex) Fang and Yifan(Lucas) Wu; Kaggle Team Name: 'Let's go 440' "
+date: "September 27, 2016"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+## install and load packages
+ipak <- function(pkg){
+  new.pkg <- pkg[!(pkg %in% installed.packages()[, "Package"])]
+  if (length(new.pkg)) 
+    install.packages(new.pkg, dependencies = TRUE)
+  sapply(pkg, require, character.only = TRUE)
+}
+
+packages <- c("dplyr","ggplot2", "plyr", "moments", "mice",
+              "VIM" ,"corrplot","car","caret","RColorBrewer",
+              "glmnet", "randomForest","xgboost","ggvis")
+ipak(packages)
+```
+
+```{r useful_functions, include=FALSE}
+# Evaluation metric (RMSE of log prices)
+eval_metric <- function(predicted_sales_price, actual_sales_price){
+  sqrt(mean(((predicted_sales_price) - log(actual_sales_price))^2))
+}
+```
+
+## Load in and explore data
+
+```{r load_data}
+house_prices_data <- read.csv('data/train.csv', stringsAsFactors = FALSE)
+house_prices_data_test <- read.csv('data/test.csv', stringsAsFactors = FALSE)
+```
+
+The training data set of housing consists of `r nrow(house_prices_data)` rows and `r ncol(house_prices_data)` columns.
+
+## Method 1: Stepwise Regression - Standing on the Shoulder of Giants
+
+Credits to the code of Sung Ha which scored 0.12794 on Kaggle's leaderboard!
+	
+```{r Sung_code}
+train_sung <- house_prices_data %>% mutate_if(is.character, as.factor)
+
+n_na <-sapply(train_sung,function(y)length(which(is.na(y)==T)))
+n_na.df<- data.frame(var=colnames(train_sung),num_NA=n_na)
+
+train_sung <- train_sung[,!(names(train_sung)%in%c("Id","Alley","PoolQC","Fence","MiscFeature"))]
+
+num<-sapply(train_sung,is.numeric)
+num<-train_sung[,num]
+
+for(i in 1:76){
+  if(is.factor(train_sung[,i])){
+    train_sung[,i]<-as.integer(train_sung[,i])
+  }
+}
+train_sung[is.na(train_sung)]<-0
+num[is.na(num)]<-0
+
+train.train<- train_sung[1:floor(length(train_sung[,1])*0.8),]
+train.train$SalePrice <- log(train.train$SalePrice)
+train.test<- train_sung[(length(train.train[,1])+1):1460,]
+train.test$SalePrice <- log(train.test$SalePrice)
+
+lm.train.train <- lm(SalePrice~.,train.train)
+# summary(lm.train.train)
+step.lm.train.train <- step(lm.train.train,trace = 0)
+# summary(step.lm.train.train)
+lm.train.train <- lm(SalePrice~.,step.lm.train.train$model)
+# plot(lm.train.train)
+
+# Load and predict on test set
+test_sung <- house_prices_data_test %>% mutate_if(is.character, as.factor)
+
+n_na <-sapply(test_sung,function(y)length(which(is.na(y)==T)))
+n_na.df<- data.frame(var=colnames(test_sung),num_NA=n_na)
+
+test_sung <- test_sung[,!(names(test_sung)%in%c("Id","Alley","PoolQC","Fence","MiscFeature"))]
+
+num<-sapply(test_sung,is.numeric)
+num<-test_sung[,num]
+
+for(i in 1:75){
+  if(is.factor(test_sung[,i])){
+    test_sung[,i]<-as.integer(test_sung[,i])
+  }
+}
+test_sung[is.na(test_sung)]<-0
+num[is.na(num)]<-0
+
+sung.predicted_values <- exp(predict(lm.train.train, newdata = test_sung))
+```
+
+## Validation
+
+LOOCV for the stepwise model.
+
+```{r cross_validation}
+# leave-one-out cross-validation
+out_of_sample_prediction <- rep(NA, nrow(train_sung))
+train_sung$SalePrice <- log(train_sung$SalePrice)
+for(data_point in 1:nrow(train_sung)){
+  # Fit model on data with point left out
+  # lm_model_loo <- lm(SalePrice ~ OverallQual + GrLivArea , data = train[-data_point, ])
+  out_of_sample_prediction[data_point] <- (predict(lm.train.train, newdata = train_sung[data_point, ]))
+}
+```
+
+
+```{r evaluate_cv}
+out_of_sample_prediction[out_of_sample_prediction < 0] <- 100
+eval_metric(out_of_sample_prediction, house_prices_data$SalePrice)
+```
+
+The final LOOCV score is `r eval_metric(out_of_sample_prediction, house_prices_data$SalePrice)`.
+
+## Method 2: Shrinkage Methods
+
+A pretty good result from stepwise regression indicates that there should be room for improvement by employing regularized regression such as Ridge Regression or LASSO.
+
+#### Explorary Data Analysis
+
+```{r read_in}
+house_prices_data_test$SalePrice <- -999
+full <- rbind(house_prices_data,house_prices_data_test)
+
+full <- full %>% mutate_if(is.character, as.factor)
+
+factor_columns <- names(which(sapply(full, class) == 'factor'))
+
+non_factor_columns <- names(which(sapply(full, class) != 'factor'))
+non_factor_columns <- non_factor_columns[!non_factor_columns %in% c("Id","SalePrice")]
+```
+
+
+If we take a look at the missing values in this data set, there are `r sum(is.na(house_prices_data))` missing values in the training set and `r sum(is.na(house_prices_data_test))` in the test set.
+
+```{r fig.width=8, fig.height=5, warning=FALSE}
+# display the pattern of missing values
+mice_plot <- aggr(full, col=c('navyblue','yellow'),
+                  numbers=T, sortVars=T,  
+                  labels=names(full), cex.axis=.8,
+                  gap=3, ylab=c("Missing data","Pattern"))
+```
+
+
+
+We can further investigate how many missing values in each column in the training set and test set:
+```{r missing_counts}
+missing_full <- sapply(full, function(x) sum(is.na(x)))
+missing_full[missing_full!=0]
+```
+
+Correlation plot
+```{r}
+M<-cor(na.omit(full[non_factor_columns]))
+corrplot(M, type="upper", order="hclust",col=brewer.pal(n=8, name="PuOr"))
+```
+
+If we take a closer look of corrlations between few varibles. 
+```{r}
+full %>% ggvis(~OverallQual, ~GrLivArea, fill = ~OverallCond) %>% layer_points()
+full %>% ggvis(~YearBuilt, ~SalePrice, fill = ~OverallQual) %>% layer_points()
+full %>% ggvis(~X1stFlrSF, ~SalePrice, fill = ~OverallQual) %>% layer_points()
+```
+#### Feature Engineering
+
+1. Replace NA in numeric variables with their mean
+2. Replace NA in categorical variables with zero
+3. Generate new variables, Age, OverallQual Square and GrLivArea Square
+4. Log-transform skewed variables
+
+```{r}
+full <- full %>% mutate(Age = YrSold - YearBuilt,
+                        OverallQual_Square = OverallQual*OverallQual,
+                        GrLivArea_Square = GrLivArea*GrLivArea)
+
+all_data <- full
+for (i in 1:length(non_factor_columns)){
+  if (skewness(all_data[non_factor_columns[i]],na.rm = TRUE) > 0.75) {
+    all_data[non_factor_columns[i]] <- log(all_data[non_factor_columns[i]]+1)
+  }
+}
+
+all_data <- all_data %>% select(-Alley,-FireplaceQu,-MiscFeature,-PoolQC,-Fence)
+
+feature_classes <- sapply(names(all_data),function(x){class(all_data[[x]])})
+categorical_feats <- names(feature_classes[feature_classes == "factor"])
+numeric_feats <-names(feature_classes[feature_classes != "factor"])
+
+numeric_df <- all_data[numeric_feats]
+
+for (x in numeric_feats) {
+  mean_value <- mean(full[[x]],na.rm = TRUE)
+  all_data[[x]][is.na(all_data[[x]])] <- mean_value
+}
+
+dummies <- dummyVars(~.,all_data[categorical_feats])
+categorical_1 <- predict(dummies,all_data[categorical_feats])
+categorical_1[is.na(categorical_1)] <- 0  
+
+all_data <- cbind(all_data[numeric_feats],categorical_1)
+
+# create data for training and test
+X_train <- all_data[1:nrow(house_prices_data),]
+X_test <- all_data[(nrow(house_prices_data)+1):nrow(all_data),]
+y <- log(house_prices_data$SalePrice+1)
+X_train$SalePrice <- NULL
+X_test$SalePrice <- NULL
+
+X_train$Id <- NULL
+X_test$Id <- NULL
+x_train <- as.matrix(X_train)
+x_test <-  as.matrix(X_test)
+```
+
+
+```{r fit_model}
+cv1=cv.glmnet(x_train,y,nfolds=10,alpha=1)
+plot(cv1)
+coef(cv1)[coef(cv1)!=0]
+predicted_values1 <- exp(predict(cv1,s=cv1$lambda.min,newx=x_test))
+```
+
+
+
+## Create Submission File
+
+```{r load_test_ data}
+# Predict on test set and fixed some outliers
+summary(predicted_values1)
+summary(sung.predicted_values)
+predicted_values1[661] <- sung.predicted_values[661]
+sung.predicted_values[1090] <- predicted_values1[1090]
+predicted_values <- (sung.predicted_values + predicted_values1)/2
+
+# Create file for submission
+submission_matrix <- data.frame(cbind(house_prices_data_test$Id, predicted_values))
+colnames(submission_matrix) = c('Id', 'SalePrice')
+submission_matrix$SalePrice <- round(submission_matrix$SalePrice)
+#submission_matrix$SalePrice <- pmax(100, submission_matrix$SalePrice)
+
+# Write submission file
+write.csv(submission_matrix, file='submission_file.csv', row.names = FALSE)
+```

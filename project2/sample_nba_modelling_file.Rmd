@@ -1,0 +1,301 @@
+---
+title: "NBA Shot Submission"
+author: "Alex Fang/VinnieLiu (Alex Fang: # xxxx & Vinnie Liu: #301079013)"
+date: "11/04/2016"
+output: html_document
+---
+
+# Introduction
+This dataset consists of an indicator called "made", representing the success of the shots, along with a variety of data fields we can use to make these predictions, including:  
+  - the shooter  
+  - the shooter's team  
+  - the opponent   
+  - the shot location  
+  - the recorded shot clock and game clock times  
+  - various player positions,  
+  - etc.  
+
+Our goal is to predict whether a particular shot made is successful.
+
+```{r setup, include=FALSE}
+pacman::p_load(fields, plotrix, dplyr,plyr, glmnet,caret)
+```
+
+```{r eval_metric, include = F}
+eval_metric <- function(response, predicted_probs) {
+  N <- length(response)
+  logloss <- -(1/N) * sum(response * log(predicted_probs) + (1-response) * log(1 - predicted_probs))
+  logloss
+}
+
+# Function that converts factor to numeric variable
+fac_to_num <- function(fac) {
+  as.numeric(as.character(fac))
+}
+```
+
+```{r load_data, include = FALSE}
+train <- read.csv("./data/train.csv")
+test <- read.csv("./data/test.csv")
+full<-rbind(train,test)
+players <- read.csv("./data/players.csv")
+```
+
+```{r plot_court_function, include = F}
+## draw the basketball court 
+draw.court = function() {
+  rect(0, 0, 94, 50)
+  circle = function(x, y, r, from = 0, to = 2 * pi, lines = FALSE, ...) {
+    theta = seq(from, to, length = 100)
+    if (lines)
+      lines(x + r * cos(theta), y + r * sin(theta), ...)
+    else polygon(x + r * cos(theta), y + r * sin(theta), ...)
+  }
+  points(c(5.25, 94 - 5.25), c(25, 25), cex = 2)
+  segments(47, 0, 47, 50)
+  circle(47, 25, 8)
+           circle(47, 25, 2, col = "lightgray")
+         theta1 = acos((25 - 35/12)/23.75)
+         circle(5.25, 25, 23.75, -pi/2 + theta1, pi/2 - theta1, TRUE)
+         circle(94 - 5.25, 25, 23.75, pi/2 + theta1, 3 * pi/2 - theta1, TRUE)
+         segments(0, 35/12, 5.25 + 23.75 * sin(theta1), 35/12)
+         segments(0, 50 - 35/12, 5.25 + 23.75 * sin(theta1), 50 - 35/12)
+         segments(94, 35/12, 94 - 5.25 - 23.75 * sin(theta1), 35/12)
+         segments(94, 50 - 35/12, 94 - 5.25 - 23.75 * sin(theta1), 50 - 35/12)
+         circle(19, 25, 6, -pi/2, pi/2, TRUE)
+         circle(19, 25, 6, pi/2, 3 * pi/2, TRUE, lty = 2)
+         circle(94 - 19, 25, 6, pi/2, 3 * pi/2, TRUE)
+         circle(94 - 19, 25, 6, -pi/2, pi/2, TRUE, lty = 2)
+         circle(5.25, 25, 4, -pi/2, pi/2, TRUE)
+         circle(94 - 5.25, 25, 4, pi/2, 3 * pi/2, TRUE)
+         rect(0, 17, 19, 33, border = "gray")
+         rect(94, 17, 94 - 19, 33, border = "gray")
+}
+
+# Function that plots the court
+plot_court <- function(main) {
+  plot(0,0,pch=46,xlim=c(0,94), ylim=c(0,50), main=main, xlab = '', ylab = '')
+  draw.court()
+}
+```
+
+```{r best_shooters, echo = F}
+# We want to plot information for the best shooters, but filter out those
+# who have fewer than 500 attempted field goals
+shot_count <- count(train, vars = "shooter")
+fg_percentage <- tapply(train$made, train$shooter, FUN = mean)
+
+# Make sure shot count is aligned with fg_percentage
+# all.equal(as.numeric(names(fg_percentage)), shot_count[, 1])
+fg_percentage <- fg_percentage[shot_count[, 2] > 1000]
+best_shooter_id <- names(which.max(fg_percentage))
+# We can see that the best_shooter_id is associated with Kevin Durant
+
+## Sorting FG% by player id and attaching to player name and position- FROM LUCAS' code
+fg_percentage<-sort(fg_percentage,decreasing=TRUE)
+top.10<-head(fg_percentage,10)
+aa<-as.data.frame(cbind(as.numeric(rownames(top.10)),as.numeric(top.10)))
+colnames(aa)<-c("player_id", "FG%")
+
+leaderboard<-left_join(aa,players[,2:5], by="player_id")
+leaderboard.display<-leaderboard[,c(3,4,5,2)]
+```
+
+# Exploratory Data Analysis
+We want to create a shot chart for the best shooter in our data set who has
+taken at least 1000 shots. This removes `r sum(shot_count[, 2] < 1000)` shooters
+from our original pool of `r nrow(shot_count)`, leaving us with just 
+`r sum(shot_count[, 2] > 1000)` to choose from. From this pool, the player with
+the highest field goal percentage in our data set is player #329525, which is Kevin Durant. 
+
+```{r kd_shot_chart, echo = F}
+kevin_durant_df <- train[train$shooter == best_shooter_id, ]
+kd_made_shots <- kevin_durant_df[kevin_durant_df$made == 1, ]
+kd_missed_shots <- kevin_durant_df[kevin_durant_df$made == 0, ]
+
+plot_court("Kevin Durant Shotchart")
+points(kd_missed_shots$shot_x, kd_missed_shots$shot_y, pch = 1,
+       col = rgb(49, 54, 149, maxColorValue = 255))
+points(kd_made_shots$shot_x, kd_made_shots$shot_y, pch = 4, 
+       col = rgb(165, 0, 38,  maxColorValue = 255))
+```
+
+```{r calc_dist, include = F}
+# X,Y coordinates for the basketball hoops
+left_hoop_xy <- cbind(5.25, 25)
+right_hoop_xy <- cbind(88.75, 25)
+
+# Function to calculate distance between shot location and hoop
+calc_shot_dist <- function(shot_data) {
+  n <- nrow(shot_data)
+  left_shot_ind <- shot_data$offense_basket == "L"
+  right_shot_ind <- shot_data$offense_basket == "R"
+  shot_dist <- numeric(n)
+  shot_dist[left_shot_ind] <- 
+    rdist(shot_data[left_shot_ind, c("shot_x", "shot_y")], left_hoop_xy)
+  shot_dist[right_shot_ind] <- 
+    rdist(shot_data[right_shot_ind, c("shot_x", "shot_y")], right_hoop_xy)
+  shot_dist
+}
+```
+# Data Clean-up and Explanatory Analysis
+
+### the Player Position Effect
+In general, each position has "typical" skills and qualities in the players that play them, like shooting abilities, passing abilities, etc. I used the players.csv file to sort by position, then sort by player ID in Excel to create a new index variable for each position. After filtering each position, I discovered a handful of shooters in the Training and Testing data that were not listed on the Players data. I made the assumption that these were typos, and made a judgement on which player it was likely to mean. 
+```{r add_position,echo=FALSE}
+full$shooter[(full$shooter)==3511]<-3512
+full$shooter[(full$shooter)==65750]<-65759
+full$shooter[(full$shooter)==168018]<-168016
+full$shooter[(full$shooter)==229561]<-229569
+full$shooter[(full$shooter)==264163]<-264019
+full$shooter[(full$shooter)==329527]<-329525
+full$shooter[(full$shooter)==329529]<-329525
+full$shooter[(full$shooter)==332797]<-332695
+full$shooter[(full$shooter)==395656]<-395391
+full$shooter[(full$shooter)==411506]<-411562
+full$shooter[(full$shooter)==458958]<-458982
+full$shooter[(full$shooter)==460836]<-460833
+full$shooter[(full$shooter)==461025]<-460833
+full$shooter[(full$shooter)==469487]<-469488
+full$shooter[(full$shooter)==504890]<-504885
+full$shooter[(full$shooter)==511643]<-511638
+full$shooter[(full$shooter)==524963]<-524952
+full$shooter[(full$shooter)==609820]<-609843
+
+for.cent<-c(2989,3155,3234,3250,3306,3381,3494,3512,57819,58414,62176,65840,65844,65871,75344,76721,168010,168013,168015,168040,168061,172631,172881,173147,214157,229649,229792,237675,253975,253995,254009,263012,263220,263894,263904,264017,265013,266554,278317,280587,292404,292407,295420,295923,295927,329185,329190,329675,329711,329715,329824,330057,330347,330421,331197,395374,398066,398090,398589,399599,399725,400585,401618,402377,402984,456449,456450,456453,457598,458718,462458,462461,467271,467468,468576,469085,469333,469488,483372,502808,502871,509450,509453,510790,511074,512753,515415,550131,550427,550992,551761,552198,552403,552806,602028,603096,606731,614746,637935,698982,699947,699950,739968,750703,750924,843762,877869)
+
+forw<-c(3257,3314,3321,3329,3396,3514,65910,168029,172571,172890,174092,214152,214159,229569,229905,253996,262890,263028,263884,264019,266358,292396,295436,295794,329525,329683,329890,332500,340764,398037,398421,400599,400612,405345,411458,462745,503807,509168,512053,513268,548635,551738,552336,552381,552523,553573,599805,599809,604490,609448,609848,639311,659780,659784,699826,703474,756880,842298)
+
+guard<-c(3100,3156,3313,3315,3388,57820,58258,61849,62414,65820,65834,76032,172692,172997,173407,174063,178537,214163,253980,262894,263565,263903,277552,278110,278479,292397,292401,295808,297774,330374,332666,332691,338365,340730,351329,395372,395391,398424,399738,400594,400661,401082,410116,411378,436242,456456,462444,503810,504523,509449,510954,511638,512995,513339,513565,513607,522878,549961,551321,551768,552319,552599,553166,553575,553721,561872,601139,739962)
+
+g.for<-c(3192,3230,3235,3361,3385,3496,3497,3501,55160,58214,58293,58360,66858,66903,75956,168032,168058,168066,172922,173004,174054,214160,229602,229738,229758,229955,241712,253997,253998,263217,263228,263229,263899,266367,276755,278973,292385,292391,292394,295809,295813,295922,295941,296605,301795,329187,329544,329710,329825,329887,330046,332695,338887,351927,393434,395365,395388,398068,398428,398434,399702,399800,410764,456451,457186,457594,457611,458730,464841,466798,469218,469484,477667,478213,502812,503773,509472,511057,512591,513058,550049,550109,550991,552335,552980,553306,553557,561509,599812,601514,602135,603106,604288,609567,739957,750654,794503,833017,844331,880954)
+
+point.g<-c(3085,3107,3508,3509,3530,61934,65759,65868,75211,171438,172537,173520,174025,229598,229726,253992,254007,262882,263231,266394,295432,296475,296572,300788,329468,329482,329524,329672,329830,329873,398043,399612,401097,410831,411562,457350,457576,457605,462459,462980,463121,463135,469083,477669,478196,502908,503689,504885,509094,509456,511068,513526,513606,522979,523820,524952,531447,551787,551975,552183,552334,552380,552805,552982,553160,553609,553779,567408,575469,602411,603097,605708,607544,608661,609790,609816,623253,697132,739958,739966,743777,744102,786293,786387,786407,792338,830636,842297,844038,877870)
+
+pow.for<-c(3229,57782,57934,65968,66027,172642,226806,229764,263902,295799,296950,330453,395648,398034,411111,457568,458982,460833,462970,469089,469234,502879,502881,508952,510784,511659,513057,513262,514883,525052,550431,551323,551991,552309,553542,553607,599786,603100,603640,607118,609569,609792,639269,659783,695069,696047,698651,744245,745825,748788,786397,786412,830647,843227,845596,846499,851153)
+
+sh.guard<-c(3062,58948,62142,65900,168036,172643,230001,254006,303807,329670,329713,329862,398590,401085,401093,409834,457569,458940,467272,470273,478206,504905,509350,511055,518947,548610,549969,551760,551771,552007,552302,552530,553184,553576,561879,571786,601538,602418,602730,604898,605885,606912,609861,659767,679323,691716,697173,697719,698985,699948,712593,715201,786406,840595,845564,847010)
+
+sm.for<-c(3504,65940,66433,168016,168051,329673,411428,456448,457185,457688,462071,468895,503779,509169,513429,513608,551959,552305,552307,553548,554804,562038,603095,604683,604734,609256,609843,660085,691518,696061,697720,697722,697982,698979,707829,803207,830646,830649,843271,879539)
+
+full$position<-rep(NA, nrow(full))
+# cent (below), for.cent, forw, guard, g.for, point.g, pow.for, sh.guard, sm.for
+
+for (i in 1:length(for.cent)){
+  full$position[(full$shooter)==for.cent[i]]<-"Forward Center"}
+for (i in 1:length(forw)){
+  full$position[(full$shooter)==forw[i]]<-"Forward"}
+for (i in 1:length(guard)){
+  full$position[(full$shooter)==guard[i]]<-"Guard"}
+for (i in 1:length(g.for)){
+  full$position[(full$shooter)==g.for[i]]<-"Guard Forward"}
+for (i in 1:length(point.g)){
+  full$position[(full$shooter)==point.g[i]]<-"Point Guard"}
+for (i in 1:length(pow.for)){
+  full$position[(full$shooter)==pow.for[i]]<-"Power Forward"}
+for (i in 1:length(sh.guard)){
+  full$position[(full$shooter)==sh.guard[i]]<-"Shooting Guard"}
+for (i in 1:length(sm.for)){
+  full$position[(full$shooter)==sm.for[i]]<-"Small Forward"}
+
+```
+Here is an example of how the position variable was created for the "Center" position:
+```{r create_center}
+cent<-c(3102,3254,3492,3493,3513,3515,65903,177575,214162,214168,229898,229912,253989,263025,263245,266369,292387,292393,292408,296379,329469,329487,329511,329875,330047,330050,333212,393436,393441,398142,398443,400617,417020,456452,457334,467471,508237,513234,514882,520388,550428,550993,552679,553158,553331,553333,553574,555263,599780,599797,599813,606642,616982,623242,639296,659782,679478,683060,739960,743822,746146,794508,830642,830650,830651,837030,839018,842301)
+
+for (i in 1:length(cent)){
+  full$position[(full$shooter)==cent[i]]<-"Center"
+}
+full$position<-factor(full$position)
+```
+
+
+### the Freethrow Effect
+I originally made the assumption that the 4000+ NA's for the variable $shot shot clock$ were for penalty freethrows, wherein the shot clock is not active. I created a new indicator variable, $freethrow$, where 1 indicates a freethrow, a sitution where the shots are taken unopposed. A 0 indicates a shot in regular play.
+
+It received a decent score on Kaggle, but learned after week 1's results (from Dani) that most of the NA's were actually due to the quarter or game having less than 24 seconds on the clock. 
+
+```{r cleanup}
+## LUCAS's code- exploring shot distance vs FG%
+train.exp<-train
+train.exp$shot_dist<-calc_shot_dist(train.exp)
+train.exp$sd<-round(train.exp$shot_dist,0)
+explore2<-train.exp%>%dplyr::group_by(sd)%>%dplyr::summarise(FG_Per=mean(made))
+plot(explore2[1:50,], type="l")
+
+# Assume that NA's on shot shot clock means penalty freethrow
+full$freethrow <- rep(0,length(full$made))
+# ft.index<-which(is.na(full$shot_shot_clock)==TRUE)- WRONG
+full$freethrow[ft.index]<-1
+
+```
+
+### the Actual Shot Clock Time Effect
+Since I wanted to include the shot shot clock variable in my model, I needed to deal with the NA's differently than I did above. Alongside the assumption that the NA's were for penalty freethrows, I assumed the best equivalent for a numerical value would be the maximum, 24 seconds. I also tried the mean of the shot clock variable, but the minimum of 0 seconds resulted in a better Kaggle score. 
+
+```{r shotclock_na}
+
+## LUCAS's code exploring shotclock vs FG%
+train.exp$sc <- round(train.exp$shot_shot_clock,0)
+explore1 <- train.exp %>% dplyr::group_by(sc)%>% 
+  dplyr::summarise(FG_Per = mean(made))
+plot(explore1[1:25,],type="l")
+
+## check which shotshotclock is NA and shotgameclock is <24 ---NEEDS TO BE FINISHED
+full$shot_shot_clock[which(is.na(full$shot_shot_clock))]<-0
+sc.na<-full[which(is.na(full$shot_shot_clock)),]
+
+```
+
+### the Nearest Defender Distance Effect
+There were a handful of NA's in the $ndd$ variable, so I replaced the NA's with the mean.
+``` {r ndd_NAs}
+# replace NA's in ndd to the mean
+full$ndd[is.na(full$ndd)]<-mean(full$ndd,na.rm=TRUE)
+```
+### the Home Effect
+```{r}
+## LUCAS's code exploring home effect
+home_effect <- train.exp %>% dplyr::group_by(home) %>% 
+                dplyr::summarize(Percentage = (sum(made)/length(made))*100)
+
+home_effect$home <- ifelse(home_effect$home==1,"Home","Away")
+
+g <- ggplot(data = home_effect, aes(x = home, y = Percentage, fill = home)) +  geom_bar(stat = 'identity' )
+g
+```
+# Model
+It seems intuitive that the distance from the hoop would have an effect on whether or not the shot
+was successful. This code provided by Luke and Jacob calculates the Euclidean distance between the shot location and the hoop. I used logistic regression to predict shot success using the variables I thought were most inherently related to the success of the shot. These variables include: the shot distance, the nearest defender distance, whether the game is home/away, and the shot shot clock time from the given data, as well as the freethrow and position variables I created.
+
+```{r data_split,echo=FALSE}
+# Split Full back into train and test
+train<-full[1:nrow(train),]
+test<-full[(nrow(train)+1):nrow(full),]
+```
+
+```{r fit_ model}
+# Fit model using only shot distance as predictor
+# Need to add some sort of cross validation
+train$shot_dist <- calc_shot_dist(train)
+y <- train$made
+X <- sparse.model.matrix(~shot_dist+freethrow+ndd+position+shot_shot_clock+home, data = train)
+fit_glm <- glmnet(X, y, family = "binomial")
+
+# Make predictions
+test$shot_dist <- calc_shot_dist(test)
+X_test <- sparse.model.matrix(~shot_dist+freethrow+ndd+position+shot_shot_clock+home, data = test)
+# Use the smallest possible s value since we only have one covariate
+# and regularization is not as necessary.
+pfit <- predict(fit_glm, X_test, s = 0.003562, type = "response")
+```
+
+### Create file for submission
+```{r subfile}
+submission_matrix <- data.frame(test$id, pfit)
+names(submission_matrix) = c('id', 'made')
+
+# Write submission file
+write.csv(submission_matrix, file='submission_file.csv', row.names = FALSE)
+```
+
